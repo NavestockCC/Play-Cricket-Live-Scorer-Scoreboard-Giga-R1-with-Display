@@ -1,12 +1,12 @@
 #include <Arduino.h>
 #include <Arduino_H7_Video.h>
+#include <Arduino_GigaDisplayTouch.h>
 #include <string.h>
 #include <stdio.h>
 #include "lvgl.h"
 #include "GigaDisplay/Giga_Display.h"
-#include "scoreboard_config/pins_and_constants.h"
-#include "scoreboard/shift_register.h"
-#include "scoreboard/display_controller.h"
+#include "shared/scoreboard_configs.h"
+#include "shared/core_link.h"
 
 /* -------------------------------------------------------------
  * HARDWARE CONFIGURATION & GLOBAL LABELS
@@ -14,7 +14,11 @@
 // Primary hardware display wrapper object instance
 Arduino_H7_Video Display(800, 480, GigaDisplayShield); 
 
-// Global object hooks for updating UI elements from BLE or main program files
+// GT911 touch controller. begin() registers it with LVGL as the pointer
+// input device -- without it the touchscreen (e.g. the config picker) is inert.
+Arduino_GigaDisplayTouch TouchDetector;
+
+// Global object hooks for updating UI elements from the M4's messages
 lv_obj_t *lbl_batA_val;
 lv_obj_t *lbl_score_val;
 lv_obj_t *lbl_batB_val;
@@ -37,7 +41,9 @@ static char combined_text_buffer[MAX_HISTORY_ITEMS * (ITEM_BUFFER_SIZE + 6)];
 
 /* -------------------------------------------------------------
  * SCOREBOARD CONFIG PICKER: lets the operator choose which physical rig
- * (SCOREBOARD_CONFIGS entry) is active, from the touchscreen.
+ * (SCOREBOARD_CONFIGS entry) is active, from the touchscreen. The M4 owns
+ * the active rig: the picker only sends it a request, and the selection is
+ * confirmed (or snapped back) by the M4's reply -- see show_active_config().
  * ------------------------------------------------------------- */
 static lv_obj_t *config_dropdown = NULL;
 static char config_options_buffer[128];
@@ -56,26 +62,21 @@ static void build_config_options_text() {
     }
 }
 
-// Fired when the operator picks a different rig from the dropdown: switches
-// the active config, re-configures that rig's pins, and repaints the
-// physical displays with the current scores through the new hardware.
+// Fired when the operator picks a different rig from the dropdown: asks the
+// M4 to switch the physical scoreboard to it. The M4 replies with the rig
+// now active, which the picker then shows (see show_active_config()).
 static void config_dropdown_event_cb(lv_event_t * e) {
     (void)e;
     if (config_dropdown == NULL) return;
 
     uint16_t selectedIndex = lv_dropdown_get_selected(config_dropdown);
-    if (selectedIndex >= (uint16_t)SCOREBOARD_CONFIG_COUNT) return;
+    coreLinkSendInt(LINK_MSG_CONFIG, selectedIndex);
+}
 
-    activeScoreboardConfigIndex = selectedIndex;
-    const ScoreboardChainsConfig& newConfig = SCOREBOARD_CONFIGS[selectedIndex];
-
-    setupShiftRegisterChain(newConfig.top);
-    setupShiftRegisterChain(newConfig.bottom);
-    update_Scoreboard();
-
-    char message[40];
-    snprintf(message, sizeof(message), "Config: %s", newConfig.name);
-    update_display_card(lbl_sidebar_log, message);
+void show_active_config(int index) {
+    if (config_dropdown == NULL) return;
+    if (index < 0 || index >= SCOREBOARD_CONFIG_COUNT) return;
+    lv_dropdown_set_selected(config_dropdown, (uint32_t)index); // doesn't fire VALUE_CHANGED
 }
 
 /* -------------------------------------------------------------
@@ -98,16 +99,15 @@ lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
     lv_obj_t *lbl_head = lv_label_create(card);
     lv_label_set_text(lbl_head, heading);
     lv_obj_set_style_text_color(lbl_head, lv_color_hex(0x555555), LV_PART_MAIN);
-    
-    const lv_font_t * base_font = lv_font_get_default();
-    lv_obj_set_style_text_font(lbl_head, base_font, LV_PART_MAIN); 
+    lv_obj_set_style_text_font(lbl_head, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_align(lbl_head, LV_ALIGN_TOP_MID, 0, 0);
 
-    // 4. Setup Dynamic Output Value Label (Large, Bold Black text centered)
+    // 4. Setup Dynamic Output Value Label (Large Black text centered).
+    // 36px keeps the widest value (e.g. overs "12.3") inside a ~95px-wide card.
     lv_obj_t *lbl_val = lv_label_create(card);
     lv_label_set_text(lbl_val, "-");
     lv_obj_set_style_text_color(lbl_val, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_val, base_font, LV_PART_MAIN); 
+    lv_obj_set_style_text_font(lbl_val, &lv_font_montserrat_36, LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(lbl_val, 2, LV_PART_MAIN);
     lv_obj_align(lbl_val, LV_ALIGN_CENTER, 0, 10);
 
@@ -155,12 +155,13 @@ void create_scoreboard_grid() {
     lv_obj_t * title = lv_label_create(header);
     lv_label_set_text(title, "Cricket Scoreboard");
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(title, lv_font_get_default(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
 
     build_config_options_text();
     config_dropdown = lv_dropdown_create(header);
     lv_dropdown_set_options(config_dropdown, config_options_buffer);
-    lv_dropdown_set_selected(config_dropdown, (uint16_t)activeScoreboardConfigIndex);
+    // Shows the boot default until the M4 reports the actual active rig.
+    lv_dropdown_set_selected(config_dropdown, (uint32_t)defaultScoreboardConfigIndex());
     lv_obj_add_event_cb(config_dropdown, config_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* -------------------------------------------------------------
@@ -283,10 +284,36 @@ void set_card_value(lv_obj_t *label, const char *new_value) {
 }
 
 /* -------------------------------------------------------------
+ * SCORE MESSAGES FROM THE M4
+ * ------------------------------------------------------------- */
+// Maps a BLE field code (as forwarded by the M4) to its score card label.
+static lv_obj_t *card_for_code(const char *code) {
+    if (strncmp(code, "B1S", 3) == 0) return lbl_batA_val;
+    if (strncmp(code, "B2S", 3) == 0) return lbl_batB_val;
+    if (strncmp(code, "BTR", 3) == 0) return lbl_score_val;
+    if (strncmp(code, "OVB", 3) == 0) return lbl_overs_val;
+    if (strncmp(code, "BTW", 3) == 0) return lbl_wickets_val;
+    if (strncmp(code, "BTT", 3) == 0) return lbl_target_val;
+    return NULL;
+}
+
+void show_score_message(const char *message) {
+    if (message == NULL || strlen(message) < 4) return;
+    lv_obj_t *card = card_for_code(message);
+    if (card == NULL) return;
+
+    // Full value text, e.g. overs "12.3" (the physical board shows only "12").
+    set_card_value(card, message + 3);
+    // Log the raw message, e.g. "• BTR142".
+    update_display_card(lbl_sidebar_log, message);
+}
+
+/* -------------------------------------------------------------
 MAIN INITIALIZATION ENTRY POINT
 ------------------------------------------------------------- */
 void display_setup() {
     Display.begin();
+    TouchDetector.begin(); // must follow Display.begin() (which calls lv_init())
     create_scoreboard_grid();
 }
 

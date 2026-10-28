@@ -31,5 +31,14 @@ void update_display_card(lv_obj_t *label, const char *new_value);
 // rolling sidebar log.
 void set_card_value(lv_obj_t *label, const char *new_value);
 
+// Applies a score message forwarded by the M4 (raw BLE text: 3-letter
+// field code + value, e.g. "BTR142" or "OVB12.3"): sets that field's card
+// and logs the message. Unknown codes are ignored.
+void show_score_message(const char *message);
+
+// Shows SCOREBOARD_CONFIGS[index] as the selected rig in the picker, as
+// reported by the M4 (which owns the active rig).
+void show_active_config(int index);
+
 #endif // GIGA_DISPLAY_H
 

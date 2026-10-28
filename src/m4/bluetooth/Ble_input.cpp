@@ -1,16 +1,20 @@
-#include "ble_input.h"
+#include "Ble_input.h"
 #include <ArduinoBLE.h>
 #include "scoreboard_config/pins_and_constants.h"
 #include "scoreboard/display_controller.h"
-#include "GigaDisplay/Giga_Display.h" // ADDED: Required to access display labels and update_display_card
+#include "shared/core_link.h" // display updates go to the M7 over the core link
 
-// Enabled only while actively watching the serial monitor on a computer.
-// Left on during standalone/USB-power-only operation, every BLE message
-// triggers a Serial.print() with nothing to drain the USB-CDC buffer --
-// on this board that can stall the loop long enough to blow through the
-// BLE supervision timeout, which shows up as random disconnects during
-// active scoring. Turn this back off before a real match.
-#define DEBUG_BLE
+// This runs on the M4, which has no USB serial: everything meant for the
+// screen or the serial monitor is sent to the M7 over the core link
+// (see shared/core_link.h) -- 'V'/'L' lines for the display, 'D' lines for
+// debug text the M7 prints to USB Serial.
+//
+// DEBUG_BLE (per-message debug logging) is defined only by the
+// "giga_r1_m4_debug" build in platformio.ini -- use it only while actively
+// watching the serial monitor on a computer. Without a monitor attached the
+// M7's Serial writes can stall; that no longer delays BLE (it's on the other
+// core) but it would freeze the touchscreen. The default "giga_r1_m4"
+// (release) build leaves it off for real matches.
 
 // BLE service/characteristic UUIDs matching the original Raspberry Pi
 const char* SCOREBOARD_SERVICE_UUID = "5a0d6a15-b664-4304-8530-3a0ec53e5bc1";
@@ -26,6 +30,36 @@ BLECharacteristic scoreboardChar(SCOREBOARD_CHAR_UUID, BLEWrite, MAX_MESSAGE_LEN
 // See recordLoopDuration() / the disconnect branch in handleBleInput().
 static unsigned long maxLoopDurationMicros = 0;
 static unsigned long messagesSinceConnect = 0;
+static unsigned long messagesDroppedSinceConnect = 0;
+
+// Incoming-message queue. The characteristic only holds its latest value,
+// so polling written() once per loop() would lose a write that arrives
+// before the previous one is read. Instead, onScoreboardWritten() copies
+// every write in here as it arrives (it runs inside BLE.poll(), on the main
+// loop thread, so no locking is needed) and handleBleInput() drains it.
+// If the queue is ever full, the OLDEST message is dropped: each message
+// carries a field's full current value, so newer ones supersede older ones.
+const int MESSAGE_QUEUE_SIZE = 16;
+static char messageQueue[MESSAGE_QUEUE_SIZE][MAX_MESSAGE_LENGTH];
+static int messageQueueHead = 0;  // next slot to read
+static int messageQueueCount = 0;
+
+static void onScoreboardWritten(BLEDevice central, BLECharacteristic characteristic) {
+  (void)central;
+  if (messageQueueCount == MESSAGE_QUEUE_SIZE) {
+    messageQueueHead = (messageQueueHead + 1) % MESSAGE_QUEUE_SIZE;
+    messageQueueCount--;
+    messagesDroppedSinceConnect++;
+  }
+
+  int length = characteristic.valueLength();
+  if (length > MAX_MESSAGE_LENGTH - 1) length = MAX_MESSAGE_LENGTH - 1;
+
+  char* slot = messageQueue[(messageQueueHead + messageQueueCount) % MESSAGE_QUEUE_SIZE];
+  memcpy(slot, characteristic.value(), length);
+  slot[length] = '\0';
+  messageQueueCount++;
+}
 
 void recordLoopDuration(unsigned long durationMicros) {
   if (durationMicros > maxLoopDurationMicros) maxLoopDurationMicros = durationMicros;
@@ -47,13 +81,14 @@ bool initBleInput() {
   // otherwise trip its supervision timeout.
   BLE.setConnectionInterval(24, 40);
 
+  scoreboardChar.setEventHandler(BLEWritten, onScoreboardWritten);
   scoreboardService.addCharacteristic(scoreboardChar);
   BLE.addService(scoreboardService);
 
   BLE.advertise();
   
   // Initialize the sidebar log with a clean status message
-  update_display_card(lbl_sidebar_log, "BLE Waiting...");
+  coreLinkSend(LINK_MSG_LOG, "BLE Waiting...");
   return true;
 }
 
@@ -77,8 +112,9 @@ static char uniqueCodes[MAX_UNIQUE_CODES][4];
 static int uniqueCodeCount = 0;
 
 void logRawMessage(const char* message, const char* code) {
-  Serial.print("BLE raw: ");
-  Serial.println(message);
+  char line[CORE_LINK_MAX_LINE];
+  snprintf(line, sizeof(line), "BLE raw: %s", message);
+  coreLinkSend(LINK_MSG_DEBUG, line);
 
   for (int i = 0; i < uniqueCodeCount; i++) {
     if (strcmp(uniqueCodes[i], code) == 0) return; // already seen
@@ -88,20 +124,18 @@ void logRawMessage(const char* message, const char* code) {
   strcpy(uniqueCodes[uniqueCodeCount], code);
   uniqueCodeCount++;
 
-  Serial.print("Unique codes so far (");
-  Serial.print(uniqueCodeCount);
-  Serial.print("): ");
-  for (int i = 0; i < uniqueCodeCount; i++) {
-    Serial.print(uniqueCodes[i]);
-    if (i < uniqueCodeCount - 1) Serial.print(", ");
-  }
-  Serial.println();
+  // One code per line keeps every line well under CORE_LINK_MAX_LINE.
+  snprintf(line, sizeof(line), "New BLE code #%d: %s", uniqueCodeCount, code);
+  coreLinkSend(LINK_MSG_DEBUG, line);
 }
 #endif
 
-// Parses one incoming message of the form <3-letter code><value>
-void processMessage(const char* message, int length) {
-  if (length < 4) return; // need at least a 3-letter code + 1 digit
+// Parses one incoming message of the form <3-letter code><value>, updates
+// the matching ScoreBoard field and forwards the message to the M7 for the
+// on-screen card and log. Returns true if the message was recognized (the
+// caller then refreshes the physical display).
+bool processMessage(const char* message) {
+  if (strlen(message) < 4) return false; // need at least a 3-letter code + 1 digit
 
   char code[4];
   memcpy(code, message, 3);
@@ -115,51 +149,42 @@ void processMessage(const char* message, int length) {
 
   if (strcmp(code, "B1S") == 0) { // BatA
     int value = atoi(valueText);
-    ScoreBoard.BatA = calculateNumberToBytes(value, ScoreBoard.BatA.digitLength);
-    set_card_value(lbl_batA_val, valueText);
+    ScoreBoard.BatA.value = value;
 
   } else if (strcmp(code, "B2S") == 0) { // BatB
     int value = atoi(valueText);
-    ScoreBoard.BatB = calculateNumberToBytes(value, ScoreBoard.BatB.digitLength);
-    set_card_value(lbl_batB_val, valueText);
+    ScoreBoard.BatB.value = value;
 
   } else if (strcmp(code, "BTR") == 0) { // Score
     int value = atoi(valueText);
-    ScoreBoard.Score = calculateNumberToBytes(value, ScoreBoard.Score.digitLength);
-    set_card_value(lbl_score_val, valueText);
+    ScoreBoard.Score.value = value;
 
   } else if (strcmp(code, "OVB") == 0) { // Overs -- value may include a decimal (e.g. "12.3")
     int value = parseWholeNumberBeforeDecimal(valueText);
-    ScoreBoard.Overs = calculateNumberToBytes(value, ScoreBoard.Overs.digitLength);
-    set_card_value(lbl_overs_val, valueText); // full text incl. decimal, e.g. "12.3"
+    ScoreBoard.Overs.value = value;
 
   } else if (strcmp(code, "BTW") == 0) { // Wickets
     int value = atoi(valueText);
-    ScoreBoard.Wickets = calculateNumberToBytes(value, ScoreBoard.Wickets.digitLength);
-    set_card_value(lbl_wickets_val, valueText);
+    ScoreBoard.Wickets.value = value;
 
   } else if (strcmp(code, "BTT") == 0) { // Target
     int value = atoi(valueText);
-    ScoreBoard.Target = calculateNumberToBytes(value, ScoreBoard.Target.digitLength);
-    set_card_value(lbl_target_val, valueText);
+    ScoreBoard.Target.value = value;
 
   } else {
-    return; // unrecognized code, ignore entirely
+    return false; // unrecognized code, ignore entirely
   }
 
-  // UPDATED: Push the raw, entire Bluetooth message string directly to the log console
-  // Instead of logging "Score: 142", it logs the actual packet stream, e.g., "• BTR142"
-  update_display_card(lbl_sidebar_log, message);
-
-  // Refresh physical hardware shift register 7-segment output segments
-  update_Scoreboard();
+  // The M7 shows the full text on the field's card (e.g. overs "12.3") and
+  // logs the raw message, e.g. "• BTR142".
+  coreLinkSend(LINK_MSG_SCORE, message);
+  return true;
 }
 
 
-// Non-blocking: checked once per loop() pass. Returns true if a BLE message
-// was processed this call, so the caller can skip that pass's LVGL redraw
-// and prioritize draining any further incoming BLE traffic instead (see
-// scoreboard_sketch.ino's loop()).
+// Non-blocking: checked once per loop() pass. Drains every queued message,
+// then refreshes the physical display once. Returns true if any BLE message
+// was processed this call.
 bool handleBleInput() {
   static bool wasConnected = false;
 
@@ -168,20 +193,20 @@ bool handleBleInput() {
 
   if (isConnected && !wasConnected) {
     // Append a connection notification alert to your display ledger
-    update_display_card(lbl_sidebar_log, "BLE Connected");
+    coreLinkSend(LINK_MSG_LOG, "BLE Connected");
     maxLoopDurationMicros = 0;
     messagesSinceConnect = 0;
+    messagesDroppedSinceConnect = 0;
   } else if (!isConnected && wasConnected) {
     // Append a disconnection alert notice when the device goes out of range
-    update_display_card(lbl_sidebar_log, "BLE Disconnected");
+    coreLinkSend(LINK_MSG_LOG, "BLE Disconnected");
 
     // One-off diagnostic (not per-message, so safe even with no monitor
     // attached) to help spot what the loop was doing right before a drop.
-    Serial.print("BLE Disconnected. Messages this session: ");
-    Serial.print(messagesSinceConnect);
-    Serial.print(", slowest loop() iteration: ");
-    Serial.print(maxLoopDurationMicros);
-    Serial.println(" us");
+    char line[CORE_LINK_MAX_LINE];
+    snprintf(line, sizeof(line), "BLE drop: %lu msgs, %lu lost, slowest %lu us",
+             messagesSinceConnect, messagesDroppedSinceConnect, maxLoopDurationMicros);
+    coreLinkSend(LINK_MSG_DEBUG, line);
 
     // Defensive: explicitly resume advertising so the board is always
     // reconnectable right away, without relying on the BLE stack resuming
@@ -190,18 +215,17 @@ bool handleBleInput() {
   }
   wasConnected = isConnected;
 
-  if (isConnected && scoreboardChar.written()) {
-    int length = scoreboardChar.valueLength();
-    if (length > MAX_MESSAGE_LENGTH - 1) length = MAX_MESSAGE_LENGTH - 1;
+  if (messageQueueCount == 0) return false;
 
-    char buffer[MAX_MESSAGE_LENGTH];
-    memcpy(buffer, scoreboardChar.value(), length);
-    buffer[length] = '\0';
-
-    processMessage(buffer, length);
+  bool scoreChanged = false;
+  while (messageQueueCount > 0) {
+    if (processMessage(messageQueue[messageQueueHead])) scoreChanged = true;
+    messageQueueHead = (messageQueueHead + 1) % MESSAGE_QUEUE_SIZE;
+    messageQueueCount--;
     messagesSinceConnect++;
-    return true;
   }
 
-  return false;
+  // Refresh physical hardware shift register 7-segment output segments
+  if (scoreChanged) update_Scoreboard();
+  return true;
 }
