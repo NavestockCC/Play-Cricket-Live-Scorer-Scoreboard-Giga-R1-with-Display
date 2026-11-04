@@ -1,38 +1,60 @@
 #include "shift_register.h"
 
-void setupShiftRegisterChain(const ShiftRegisterChainConfig& chain) {
-  // G/OE is active-low and pulled up to Rail L (outputs disabled). Write
-  // HIGH before AND after pinMode(): on the Giga core pinMode() re-creates
-  // the pin, so this keeps OE from glitching low while it becomes an output.
-  digitalWrite(chain.oePin, HIGH);
-  pinMode(chain.oePin, OUTPUT);
-  digitalWrite(chain.oePin, HIGH);
+// Half-period of the bit-banged SRCK/RCK clocks. mbed GPIO writes are fast
+// enough to clock the TPIC6B595s at several MHz, too fast for long scoreboard
+// cable runs; 1us keeps the edges at roughly the speed Arduino shiftOut()
+// produced (~500kHz).
+const uint32_t CLOCK_HALF_PERIOD_NS = 1000;
 
-  pinMode(chain.serPin, OUTPUT);
-  pinMode(chain.srckPin, OUTPUT);
-  pinMode(chain.rckPin, OUTPUT);
-  digitalWrite(chain.rckPin, LOW);
+static std::unique_ptr<mbed::DigitalInOut> makeOutput(int arduinoPin, int initialValue) {
+  return std::unique_ptr<mbed::DigitalInOut>(new mbed::DigitalInOut(
+      digitalPinToPinName(arduinoPin), PIN_OUTPUT, PullNone, initialValue));
 }
 
-void enableShiftRegisterOutputs(const ShiftRegisterChainConfig& chain) {
-  digitalWrite(chain.oePin, LOW);
+void ShiftRegisterChain::attach(const ShiftRegisterChainConfig& config) {
+  release();
+  // G/OE is active-low and pulled up to Rail L: created HIGH (outputs off).
+  oe   = makeOutput(config.oePin, 1);
+  ser  = makeOutput(config.serPin, 0);
+  srck = makeOutput(config.srckPin, 0);
+  rck  = makeOutput(config.rckPin, 0);
+  numSegments = config.numSegments;
 }
 
-void releaseShiftRegisterChain(const ShiftRegisterChainConfig& chain) {
-  digitalWrite(chain.oePin, HIGH); // blank the displays first
-  pinMode(chain.oePin, INPUT);     // external pull-up keeps OE high
-  pinMode(chain.serPin, INPUT);
-  pinMode(chain.srckPin, INPUT);
-  pinMode(chain.rckPin, INPUT);
+void ShiftRegisterChain::release() {
+  if (!oe) return;
+  oe->write(1); // blank the displays first
+  oe->input();  // external pull-up keeps OE high
+  ser->input();
+  srck->input();
+  rck->input();
+  oe.reset();
+  ser.reset();
+  srck.reset();
+  rck.reset();
+  numSegments = 0;
 }
 
-void pushToShiftRegisters(const ShiftRegisterChainConfig& chain, const byte values[], int count) {
-  digitalWrite(chain.rckPin, LOW);
-  for (int i = count; i < chain.numSegments; i++) {
-    shiftOut(chain.serPin, chain.srckPin, MSBFIRST, ALL_SEGMENTS_OFF);
+void ShiftRegisterChain::enableOutputs() {
+  if (oe) oe->write(0);
+}
+
+void ShiftRegisterChain::shiftByte(byte value) {
+  for (int bit = 7; bit >= 0; bit--) { // MSB first
+    ser->write((value >> bit) & 1);
+    wait_ns(CLOCK_HALF_PERIOD_NS);
+    srck->write(1);
+    wait_ns(CLOCK_HALF_PERIOD_NS);
+    srck->write(0);
   }
-  for (int i = 0; i < count; i++) {
-    shiftOut(chain.serPin, chain.srckPin, MSBFIRST, values[i]);
-  }
-  digitalWrite(chain.rckPin, HIGH);
+}
+
+void ShiftRegisterChain::push(const byte values[], int count) {
+  if (!oe) return;
+  rck->write(0);
+  for (int i = count; i < numSegments; i++) shiftByte(ALL_SEGMENTS_OFF);
+  for (int i = 0; i < count; i++) shiftByte(values[i]);
+  wait_ns(CLOCK_HALF_PERIOD_NS);
+  rck->write(1);
+  wait_ns(CLOCK_HALF_PERIOD_NS);
 }

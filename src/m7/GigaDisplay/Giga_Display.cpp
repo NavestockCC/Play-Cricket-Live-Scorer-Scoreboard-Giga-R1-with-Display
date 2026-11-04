@@ -6,26 +6,22 @@
 #include "lvgl.h"
 #include "GigaDisplay/Giga_Display.h"
 #include "shared/scoreboard_configs.h"
+#include "shared/score_fields.h"
 #include "shared/core_link.h"
 
 /* -------------------------------------------------------------
  * HARDWARE CONFIGURATION & GLOBAL LABELS
  * ------------------------------------------------------------- */
 // Primary hardware display wrapper object instance
-Arduino_H7_Video Display(800, 480, GigaDisplayShield); 
+static Arduino_H7_Video Display(800, 480, GigaDisplayShield);
 
 // GT911 touch controller. begin() registers it with LVGL as the pointer
 // input device -- without it the touchscreen (e.g. the config picker) is inert.
-Arduino_GigaDisplayTouch TouchDetector;
+static Arduino_GigaDisplayTouch TouchDetector;
 
-// Global object hooks for updating UI elements from the M4's messages
-lv_obj_t *lbl_batA_val;
-lv_obj_t *lbl_score_val;
-lv_obj_t *lbl_batB_val;
-lv_obj_t *lbl_wickets_val;
-lv_obj_t *lbl_overs_val;
-lv_obj_t *lbl_target_val;
-lv_obj_t *lbl_sidebar_log; // Global handle targeting the rolling list view
+// Value label of each field's score card, indexed by ScoreFieldId.
+static lv_obj_t *score_cards[FIELD_COUNT];
+static lv_obj_t *lbl_sidebar_log; // the rolling log list
 
 /* -------------------------------------------------------------
  * ROLLING LOG TRACKING MEMORY ARRAYS
@@ -82,7 +78,7 @@ void show_active_config(int index) {
 /* -------------------------------------------------------------
  * HELPER FUNCTION: CREATE A STYLIZED WHITE SCORE CARD
  * ------------------------------------------------------------- */
-lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
+static lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
     // 1. Instantiate layout cell backing container box 
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_set_grid_cell(card, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
@@ -117,7 +113,7 @@ lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
 /* -------------------------------------------------------------
  * CORE SCOREBOARD UI GENERATOR
  * ------------------------------------------------------------- */
-void create_scoreboard_grid() {
+static void create_scoreboard_grid() {
     // 1. Initialize screen layer backing properties
     lv_obj_t * scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x03989e), LV_PART_MAIN);
@@ -183,15 +179,16 @@ void create_scoreboard_grid() {
     lv_obj_set_grid_dsc_array(left_panel, left_col_dsc, left_row_dsc);
     lv_obj_set_layout(left_panel, LV_LAYOUT_GRID);
 
-    // Build upper row metric blocks (Row index 0)
-    lbl_batA_val  = create_card(left_panel, "Bat A",  0, 0);
-    lbl_score_val = create_card(left_panel, "Score",  1, 0);
-    lbl_batB_val  = create_card(left_panel, "Bat B",  2, 0);
-
-    // Build lower row metric blocks (Row index 1)
-    lbl_wickets_val = create_card(left_panel, "Wickets", 0, 1);
-    lbl_overs_val   = create_card(left_panel, "Overs",   1, 1);
-    lbl_target_val  = create_card(left_panel, "Target",  2, 1);
+    // Card positions: {field, column, row}
+    static const struct { ScoreFieldId field; int col; int row; } card_cells[FIELD_COUNT] = {
+        {FIELD_BAT_A,   0, 0}, {FIELD_SCORE, 1, 0}, {FIELD_BAT_B,  2, 0},
+        {FIELD_WICKETS, 0, 1}, {FIELD_OVERS, 1, 1}, {FIELD_TARGET, 2, 1},
+    };
+    for (int i = 0; i < FIELD_COUNT; i++) {
+        ScoreFieldId field = card_cells[i].field;
+        score_cards[field] = create_card(left_panel, SCORE_FIELDS[field].label,
+                                         card_cells[i].col, card_cells[i].row);
+    }
 
     /* -------------------------------------------------------------
      * RIGHT PANEL SUB-GRID: Sidebar Module (50% Width)
@@ -237,8 +234,8 @@ void create_scoreboard_grid() {
 /* -------------------------------------------------------------
  * DYNAMIC ENGINE: ROLLING UPDATE BULLETED LIST CONTROLLER
  * ------------------------------------------------------------- */
-void update_display_card(lv_obj_t *label, const char *new_value) {
-    if (label == NULL || new_value == NULL) return;
+void append_log_line(const char *new_value) {
+    if (lbl_sidebar_log == NULL || new_value == NULL) return;
 
     // 1. Shift memory array metrics when max list index constraints are reached
     if (history_count >= MAX_HISTORY_ITEMS) {
@@ -272,40 +269,20 @@ void update_display_card(lv_obj_t *label, const char *new_value) {
     }
 
     // 4. Force repaint payload message block onto the layout layer
-    lv_label_set_text(label, combined_text_buffer);
-}
-
-/* -------------------------------------------------------------
- * SIMPLE SETTER: SINGLE CURRENT VALUE (SCORE CARDS)
- * ------------------------------------------------------------- */
-void set_card_value(lv_obj_t *label, const char *new_value) {
-    if (label == NULL || new_value == NULL) return;
-    lv_label_set_text(label, new_value);
+    lv_label_set_text(lbl_sidebar_log, combined_text_buffer);
 }
 
 /* -------------------------------------------------------------
  * SCORE MESSAGES FROM THE M4
  * ------------------------------------------------------------- */
-// Maps a BLE field code (as forwarded by the M4) to its score card label.
-static lv_obj_t *card_for_code(const char *code) {
-    if (strncmp(code, "B1S", 3) == 0) return lbl_batA_val;
-    if (strncmp(code, "B2S", 3) == 0) return lbl_batB_val;
-    if (strncmp(code, "BTR", 3) == 0) return lbl_score_val;
-    if (strncmp(code, "OVB", 3) == 0) return lbl_overs_val;
-    if (strncmp(code, "BTW", 3) == 0) return lbl_wickets_val;
-    if (strncmp(code, "BTT", 3) == 0) return lbl_target_val;
-    return NULL;
-}
-
 void show_score_message(const char *message) {
-    if (message == NULL || strlen(message) < 4) return;
-    lv_obj_t *card = card_for_code(message);
-    if (card == NULL) return;
+    ScoreFieldId field = findScoreField(message);
+    if (field == FIELD_COUNT || score_cards[field] == NULL) return;
 
     // Full value text, e.g. overs "12.3" (the physical board shows only "12").
-    set_card_value(card, message + 3);
+    lv_label_set_text(score_cards[field], message + SCORE_CODE_LENGTH);
     // Log the raw message, e.g. "• BTR142".
-    update_display_card(lbl_sidebar_log, message);
+    append_log_line(message);
 }
 
 /* -------------------------------------------------------------

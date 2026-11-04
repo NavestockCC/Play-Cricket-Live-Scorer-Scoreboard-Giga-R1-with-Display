@@ -12,6 +12,10 @@
  * earlier on the include path, so a project lv_conf.h is silently ignored.
  * LV_CONF_PATH is used by LVGL itself, Arduino_H7_Video and this project
  * alike, so every part of the build sees the same configuration.
+ *
+ * PlatformIO can't tell that LVGL depends on this file (it's included via
+ * that macro), so editing it doesn't rebuild LVGL -- run a clean build
+ * (`pio run -t clean`) afterwards.
  */
 #include "lv_conf_9.h"
 
@@ -28,5 +32,13 @@
  * library isn't part of this build (LVGL 9.6+ fails to compile with it on). */
 #undef  LV_USE_DRAW_ARM2D_SYNC
 #define LV_USE_DRAW_ARM2D_SYNC 0
+
+/* LVGL 9.6 deprecated two options the core's config still sets, warning once
+ * per compiled file. Same settings under the current names: */
+/* Matches the core's LV_COLOR_DEPTH 16, which stays defined -- setting this
+ * stops LVGL deriving it from LV_COLOR_DEPTH (the deprecated path). */
+#define LV_COLOR_FORMAT_DEFAULT LV_COLOR_FORMAT_RGB565
+/* Only included <stdint.h>; the core's LV_ASSERT_HANDLER is still used. */
+#undef  LV_ASSERT_HANDLER_INCLUDE
 
 #endif /* SCOREBOARD_LV_CONF_H */
