@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Arduino_H7_Video.h>
+#include "dsi.h" // Arduino_H7_Video's display-controller helpers, for display_flush()
 #include <Arduino_GigaDisplayTouch.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,8 +27,8 @@ static lv_obj_t *lbl_sidebar_log; // the rolling log list
 /* -------------------------------------------------------------
  * ROLLING LOG TRACKING MEMORY ARRAYS
  * ------------------------------------------------------------- */
-#define MAX_HISTORY_ITEMS 15
-#define ITEM_BUFFER_SIZE  32 
+#define MAX_HISTORY_ITEMS 12 // as many lines as fit above the BLE signal chart
+#define ITEM_BUFFER_SIZE  32
 
 static char history_log[MAX_HISTORY_ITEMS][ITEM_BUFFER_SIZE];
 static int history_count = 0;
@@ -76,6 +77,45 @@ void show_active_config(int index) {
 }
 
 /* -------------------------------------------------------------
+ * BLE SIGNAL CHART: the connected phone's signal strength (RSSI) over the
+ * last minute, one point a second from the BLE thread (see show_ble_signal()).
+ * ------------------------------------------------------------- */
+#define SIGNAL_CARD_HEIGHT  140  // px, below the log in the right panel
+#define SIGNAL_CHART_POINTS  60  // one a second: the last minute
+#define SIGNAL_MIN_DBM     -100  // chart range; readings outside it are
+#define SIGNAL_MAX_DBM      -40  //   drawn at the edge
+#define SIGNAL_GRID_LINES     4  // at -100, -80, -60 and -40 dBm
+#define SIGNAL_SCALE_WIDTH   44  // px, fits the "-100" label
+#define SIGNAL_PLOT_PAD       8  // px above and below the plot: room for the end labels
+
+static lv_obj_t *signal_chart = NULL;
+static lv_chart_series_t *signal_series = NULL;
+static lv_obj_t *lbl_signal_value = NULL;
+static lv_obj_t *signal_offline_block = NULL; // red "BLE not connected" over the chart
+
+// Shows the latest reading above the chart, with how good it is in words
+// and colour -- or, with nothing connected, the red "BLE not connected"
+// block over the chart instead.
+static void show_signal_reading(int rssi) {
+    bool connected = (rssi != BLE_RSSI_NONE);
+    lv_obj_set_hidden(signal_offline_block, connected);
+    if (!connected) {
+        lv_label_set_text(lbl_signal_value, ""); // the block says it
+        return;
+    }
+
+    // Tested with a phone: the connection held down to about -95 dBm and
+    // dropped below it, so Weak means "may drop".
+    const char *level = "Weak";  uint32_t color = 0xF44336;      // red
+    if (rssi >= -60)      { level = "Strong"; color = 0x4CAF50; } // green
+    else if (rssi >= -70) { level = "Good";   color = 0x8BC34A; } // light green
+    else if (rssi >= -95) { level = "Fair";   color = 0xFFC107; } // amber
+
+    lv_label_set_text_fmt(lbl_signal_value, "%d dBm  %s", rssi, level);
+    lv_obj_set_style_text_color(lbl_signal_value, lv_color_hex(color), LV_PART_MAIN);
+}
+
+/* -------------------------------------------------------------
  * HELPER FUNCTION: CREATE A STYLIZED WHITE SCORE CARD
  * ------------------------------------------------------------- */
 static lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
@@ -107,7 +147,94 @@ static lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int
     lv_obj_set_style_text_letter_space(lbl_val, 2, LV_PART_MAIN);
     lv_obj_align(lbl_val, LV_ALIGN_CENTER, 0, 10);
 
-    return lbl_val; 
+    return lbl_val;
+}
+
+/* -------------------------------------------------------------
+ * HELPER FUNCTION: CREATE THE BLE SIGNAL CARD
+ * Heading and latest reading on top; below, the chart with a dBm scale.
+ * ------------------------------------------------------------- */
+static void create_signal_card(lv_obj_t *parent, int col, int row) {
+    // 1. Black card, matching the log box above it
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_grid_cell(card, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
+    lv_obj_set_style_bg_color(card, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(card, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(card, 0, LV_PART_MAIN);
+
+    // Row 0: heading + reading. Row 1: scale + chart.
+    static int32_t col_dsc[] = {SIGNAL_SCALE_WIDTH, LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+    static int32_t row_dsc[] = {LV_GRID_CONTENT, LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+    lv_obj_set_grid_dsc_array(card, col_dsc, row_dsc);
+    lv_obj_set_layout(card, LV_LAYOUT_GRID);
+
+    // 2. Heading (left) and latest reading (right), sharing the top row
+    lv_obj_t *heading = lv_label_create(card);
+    lv_label_set_text(heading, "BLE signal, last minute");
+    lv_obj_set_style_text_color(heading, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
+    lv_obj_set_grid_cell(heading, LV_GRID_ALIGN_START, 0, 2, LV_GRID_ALIGN_CENTER, 0, 1);
+
+    lbl_signal_value = lv_label_create(card);
+    lv_obj_set_grid_cell(lbl_signal_value, LV_GRID_ALIGN_END, 0, 2, LV_GRID_ALIGN_CENTER, 0, 1);
+
+    // 3. dBm scale. Same vertical padding as the chart, so its ticks line up
+    // with the chart's grid lines and the end labels fit inside.
+    lv_obj_t *scale = lv_scale_create(card);
+    lv_obj_set_grid_cell(scale, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
+    lv_scale_set_mode(scale, LV_SCALE_MODE_VERTICAL_LEFT);
+    lv_scale_set_range(scale, SIGNAL_MIN_DBM, SIGNAL_MAX_DBM);
+    lv_scale_set_total_tick_count(scale, SIGNAL_GRID_LINES);
+    lv_scale_set_major_tick_every(scale, 1);
+    lv_obj_set_style_pad_ver(scale, SIGNAL_PLOT_PAD, LV_PART_MAIN);
+    lv_obj_set_style_line_color(scale, lv_color_hex(0x444444), LV_PART_MAIN);      // axis line
+    lv_obj_set_style_line_color(scale, lv_color_hex(0x444444), LV_PART_INDICATOR); // ticks
+    lv_obj_set_style_length(scale, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_left(scale, 4, LV_PART_INDICATOR); // tick to label gap
+    lv_obj_set_style_text_color(scale, lv_color_hex(0xAAAAAA), LV_PART_INDICATOR);
+
+    // 4. The chart. The theme draws charts as white bordered cards; make it a
+    // bare plot on the black card instead.
+    signal_chart = lv_chart_create(card);
+    lv_obj_set_grid_cell(signal_chart, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
+    lv_obj_set_style_bg_opa(signal_chart, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(signal_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(signal_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(signal_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(signal_chart, SIGNAL_PLOT_PAD, LV_PART_MAIN);
+    lv_obj_set_style_line_color(signal_chart, lv_color_hex(0x444444), LV_PART_MAIN); // grid lines
+    lv_obj_set_style_line_width(signal_chart, 2, LV_PART_ITEMS);  // the signal line
+    lv_obj_set_style_size(signal_chart, 0, 0, LV_PART_INDICATOR);  // no dot on each point
+
+    lv_chart_set_type(signal_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_update_mode(signal_chart, LV_CHART_UPDATE_MODE_SHIFT);
+    lv_chart_set_point_count(signal_chart, SIGNAL_CHART_POINTS);
+    lv_chart_set_axis_range(signal_chart, LV_CHART_AXIS_PRIMARY_Y, SIGNAL_MIN_DBM, SIGNAL_MAX_DBM);
+    lv_chart_set_div_line_count(signal_chart, SIGNAL_GRID_LINES, 0);
+    // Starts with every point empty (LV_CHART_POINT_NONE): no line yet.
+    signal_series = lv_chart_add_series(signal_chart, lv_color_hex(0x03989e), LV_CHART_AXIS_PRIMARY_Y);
+
+    // 5. Red "BLE not connected" block over the scale and chart while nothing
+    // is connected (see show_signal_reading()). Same grid cells, created
+    // last, so it's drawn on top.
+    signal_offline_block = lv_obj_create(card);
+    lv_obj_set_grid_cell(signal_offline_block, LV_GRID_ALIGN_STRETCH, 0, 2, LV_GRID_ALIGN_STRETCH, 1, 1);
+    lv_obj_set_style_bg_color(signal_offline_block, lv_color_hex(0xD32F2F), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(signal_offline_block, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(signal_offline_block, 8, LV_PART_MAIN);
+    lv_obj_set_style_border_width(signal_offline_block, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(signal_offline_block, 0, LV_PART_MAIN);
+
+    lv_obj_t *offline_text = lv_label_create(signal_offline_block);
+    lv_label_set_text(offline_text, "BLE not connected");
+    lv_obj_set_style_text_color(offline_text, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(offline_text, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_center(offline_text);
+
+    show_signal_reading(BLE_RSSI_NONE); // nothing is connected yet
 }
 
 /* -------------------------------------------------------------
@@ -192,15 +319,17 @@ static void create_scoreboard_grid() {
 
     /* -------------------------------------------------------------
      * RIGHT PANEL SUB-GRID: Sidebar Module (50% Width)
+     * Rolling log on top, BLE signal chart below it.
      * ------------------------------------------------------------- */
     lv_obj_t * right_panel = lv_obj_create(main_container);
     lv_obj_set_grid_cell(right_panel, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
     lv_obj_set_style_bg_opa(right_panel, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(right_panel, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(right_panel, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(right_panel, 15, LV_PART_MAIN);
 
     static int32_t right_col_dsc[] = {LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
-    static int32_t right_row_dsc[] = {LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+    static int32_t right_row_dsc[] = {LV_GRID_FR(1), SIGNAL_CARD_HEIGHT, LV_GRID_TEMPLATE_LAST};
 
     lv_obj_set_grid_dsc_array(right_panel, right_col_dsc, right_row_dsc);
     lv_obj_set_layout(right_panel, LV_LAYOUT_GRID);
@@ -229,6 +358,11 @@ static void create_scoreboard_grid() {
     // FIXED / RECOMMENDED ADJUSTMENT: Left-align list blocks so bullets line up flush
     lv_obj_set_style_text_align(lbl_sidebar_log, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
     lv_obj_align(lbl_sidebar_log, LV_ALIGN_TOP_LEFT, 5, 5);
+
+    /* -------------------------------------------------------------
+     * BLE SIGNAL CHART (below the log)
+     * ------------------------------------------------------------- */
+    create_signal_card(right_panel, 0, 1);
 }
 
 /* -------------------------------------------------------------
@@ -286,10 +420,66 @@ void show_score_message(const char *message) {
 }
 
 /* -------------------------------------------------------------
+ * BLE SIGNAL READINGS FROM THE BLE THREAD
+ * ------------------------------------------------------------- */
+void show_ble_signal(int rssi) {
+    if (signal_chart == NULL) return;
+
+    // A gap in the line while nothing is connected. Readings outside the
+    // chart's range are drawn at its edge.
+    int32_t point = (rssi == BLE_RSSI_NONE) ? LV_CHART_POINT_NONE
+                                            : constrain(rssi, SIGNAL_MIN_DBM, SIGNAL_MAX_DBM);
+    lv_chart_set_next_value(signal_chart, signal_series, point);
+    show_signal_reading(rssi);
+}
+
+/* -------------------------------------------------------------
+ * DISPLAY FLUSH: copies each chunk LVGL renders onto the screen
+ *
+ * Replaces Arduino_H7_Video's LVGL 9 flush callback, which reallocates its
+ * rotation buffer on every flush (at twice the size it needs) without
+ * checking the result. Once the heap is fragmented enough for that realloc
+ * to fail, it leaks the old buffer and rotates into address 0: the screen
+ * stops updating, and each later failure leaks another buffer until the
+ * heap is full. (Seen a minute into scoring with a phone connected.) This
+ * one rotates into a single fixed buffer instead.
+ * ------------------------------------------------------------- */
+// LVGL renders at most one draw buffer's worth per flush, and
+// Arduino_H7_Video sizes that at width x height / 10 bytes.
+static uint8_t rotated_buf[800 * 480 / 10];
+
+static void display_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+    int32_t w = lv_area_get_width(area);
+    int32_t h = lv_area_get_height(area);
+    lv_color_format_t cf = lv_display_get_color_format(disp);
+    uint32_t rotated_stride = lv_draw_buf_width_to_stride(h, cf);
+
+    // Can't happen (see above), but never write past the buffer.
+    if (rotated_stride * w > sizeof(rotated_buf)) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    // The panel is portrait (480 x 800) and the UI landscape, so every chunk
+    // is rotated (Display.begin() sets LV_DISPLAY_ROTATION_270) and placed
+    // where it lands on the panel -- the same mapping as Arduino_H7_Video.
+    lv_draw_rotate(px_map, rotated_buf, w, h, lv_draw_buf_width_to_stride(w, cf), rotated_stride,
+                   lv_display_get_rotation(disp), cf);
+    int32_t panel_x = lv_display_get_vertical_resolution(disp) - area->y2 - 1;
+    int32_t panel_y = area->x1;
+    uint32_t offset = (panel_x + dsi_getDisplayXSize() * panel_y) * sizeof(uint16_t);
+
+    // Copies with DMA2D and waits for it (cleaning the data cache first).
+    dsi_lcdDrawImage(rotated_buf, (void *)(dsi_getActiveFrameBuffer() + offset), h, w, DMA2D_INPUT_RGB565);
+    lv_display_flush_ready(disp);
+}
+
+/* -------------------------------------------------------------
 MAIN INITIALIZATION ENTRY POINT
 ------------------------------------------------------------- */
 void display_setup() {
     Display.begin();
+    lv_display_set_flush_cb(lv_display_get_default(), display_flush); // see display_flush()
     TouchDetector.begin(); // must follow Display.begin() (which calls lv_init())
     create_scoreboard_grid();
 }
