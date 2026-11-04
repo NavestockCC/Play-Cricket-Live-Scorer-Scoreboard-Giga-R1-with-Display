@@ -4,9 +4,9 @@
   The Giga runs two firmwares, one per core, talking over the core link
   (shared/core_link.h):
   - M7 (this firmware): BLE input from the Play Cricket app, and the Giga
-    Display Shield UI -- score cards, rolling log and rig picker (LVGL +
-    touch). Forwards every score to the M4, boots the M4 and prints the
-    M4's debug lines to USB Serial.
+    Display Shield UI -- score cards, rolling log, BLE signal chart and rig
+    picker (LVGL + touch). Forwards every score to the M4, boots the M4 and
+    prints the M4's debug lines to USB Serial.
   - M4 (src/m4/): the physical 7-segment scoreboard (shift registers). Owns
     the active rig; this core shows what the M4 reports.
 
@@ -15,6 +15,7 @@
 
   File layout:
   - m7/bluetooth/Ble_input.h/.cpp       -> BLE "PlayCricketScorer" input thread
+  - m7/bluetooth/Ble_hci.h/.cpp         -> fix for a hang in ArduinoBLE
   - m7/GigaDisplay/Giga_Display.h/.cpp   -> LVGL UI, incl. the rig picker
   - m7/GigaDisplay/scoreboard_lv_conf.h  -> LVGL configuration
   - shared/                              -> rig presets, fields, core link (both cores)
@@ -24,7 +25,9 @@
   - loop() thread: everything LVGL (UI updates and lv_timer_handler()) and
     Serial. Sleeps on 'uiInbox' between LVGL timers, so it wakes as soon as
     the M4 or the BLE thread posts something.
-  - "ble" thread (m7/bluetooth/Ble_input.cpp): all ArduinoBLE calls.
+  - "ble" thread (m7/bluetooth/Ble_input.cpp): all ArduinoBLE calls. Same
+    priority as loop(): the RTOS time-slices them, so neither can freeze
+    the other.
   - RPC thread (RPC library): queues lines from the M4 into 'uiInbox'.
   - Arduino_H7_Video's thread: feeds LVGL's tick.
 */
@@ -56,6 +59,7 @@ static void handleUiInbox() {
       case LINK_MSG_SCORE:  show_score_message(text); break;
       case LINK_MSG_LOG:    append_log_line(text); break;
       case LINK_MSG_CONFIG: show_active_config(atoi(text)); break;
+      case LINK_MSG_RSSI:   show_ble_signal(atoi(text)); break;
       case LINK_MSG_DEBUG:
         Serial.println(text);
         break;

@@ -24,7 +24,11 @@
 //                      has no USB serial of its own).
 //
 // The M7 also uses these types for lines its BLE thread posts to the UI
-// (see m7/main.cpp): 'V' for scores, 'L' for log lines, 'D' for debug.
+// (see m7/main.cpp): 'V' for scores, 'L' for log lines, 'D' for debug. Plus
+// one UI-only type that never crosses the link:
+//   'R' + dBm          Signal strength (RSSI) of the connected phone, once a
+//                      second, for the signal chart. BLE_RSSI_NONE when
+//                      nothing is connected.
 
 #include <Arduino.h>
 #include "line_queue.h"
@@ -33,6 +37,11 @@ const char LINK_MSG_SCORE  = 'V';
 const char LINK_MSG_LOG    = 'L';
 const char LINK_MSG_CONFIG = 'C';
 const char LINK_MSG_DEBUG  = 'D';
+const char LINK_MSG_RSSI   = 'R'; // M7 only, see above
+
+// 'R' value for "no reading" -- ArduinoBLE's own, what BLE.rssi() returns
+// when nothing is connected.
+const int BLE_RSSI_NONE = 127;
 
 const int CORE_LINK_MAX_LINE = MAX_LINE_LENGTH; // incl. type char, excl. '\n', incl. '\0'
 

@@ -1,5 +1,6 @@
 #include "Ble_input.h"
 #include <ArduinoBLE.h>
+#include "Ble_hci.h"
 #include "shared/core_link.h" // scores go to the M4 over the core link
 #include "shared/score_fields.h"
 
@@ -28,11 +29,18 @@ const int MAX_MESSAGE_LENGTH = 8;
 // BLE event (write, connect, disconnect) wakes it immediately.
 const uint32_t BLE_WAIT_TIMEOUT_MS = 50;
 
+// How often the connected phone's signal strength is posted to the UI's
+// signal chart (one chart point per post).
+const uint32_t RSSI_REPORT_INTERVAL_MS = 1000;
+
 BLEService scoreboardService(SCOREBOARD_SERVICE_UUID);
 BLECharacteristic scoreboardChar(SCOREBOARD_CHAR_UUID, BLEWrite, MAX_MESSAGE_LENGTH);
 
-// Above the UI thread, so LVGL rendering never delays BLE.
-static rtos::Thread bleThread(osPriorityAboveNormal, 8192, nullptr, "ble");
+// Same priority as the UI (loop()) thread. When both are busy the RTOS gives
+// each a 5 ms turn, so ArduinoBLE's busy-waits (it has several, e.g. while
+// the radio answers a command) can't freeze the screen, and LVGL rendering
+// can't hold up BLE for long.
+static rtos::Thread bleThread(osPriorityNormal, 8192, nullptr, "ble");
 static LineQueue* uiQueue = nullptr;
 
 // Disconnect diagnostics -- reset on connect, reported once on disconnect.
@@ -40,6 +48,8 @@ static LineQueue* uiQueue = nullptr;
 static unsigned long maxWorkDurationMicros = 0;
 static unsigned long messagesSinceConnect = 0;
 static unsigned long messagesDroppedSinceConnect = 0;
+static unsigned long flushedAtConnect = 0;  // bleHciFlushedPackets() then
+static unsigned long timedOutAtConnect = 0; // bleHciTimedOutPackets() then
 
 // Incoming-message queue. The characteristic only holds its latest value,
 // so polling written() once per pass would lose a write that arrives
@@ -80,12 +90,12 @@ static bool initBle() {
   BLE.setDeviceName("PlayCricketScorer");
   BLE.setAdvertisedService(scoreboardService);
 
-  // Widen the connection interval range we advertise (units of 1.25ms --
-  // this is 30ms-50ms) so the central has more slack per connection event.
-  // Doesn't fix an OS-level background suspend or an RF/interference issue,
-  // but gives more headroom against transient timing hiccups that could
-  // otherwise trip its supervision timeout.
-  BLE.setConnectionInterval(24, 40);
+  // Ask the phone for a 15 ms connection interval (units of 1.25 ms). Each
+  // score message takes about two connection events (the phone's write, then
+  // our reply), so this roughly halves how long a ball's updates take at a
+  // phone's usual 30 ms. Exactly 15 ms is one of the settings iPhones accept.
+  // (ArduinoBLE only asks if the phone's interval is outside this range.)
+  BLE.setConnectionInterval(12, 12);
 
   scoreboardChar.setEventHandler(BLEWritten, onScoreboardWritten);
   scoreboardService.addCharacteristic(scoreboardChar);
@@ -155,6 +165,8 @@ static void handleBleInput() {
     maxWorkDurationMicros = 0;
     messagesSinceConnect = 0;
     messagesDroppedSinceConnect = 0;
+    flushedAtConnect = bleHciFlushedPackets();
+    timedOutAtConnect = bleHciTimedOutPackets();
   } else if (!isConnected && wasConnected) {
     uiQueue->post(LINK_MSG_LOG, "BLE Disconnected");
 
@@ -164,6 +176,16 @@ static void handleBleInput() {
     snprintf(line, sizeof(line), "BLE drop: %lu msgs, %lu lost, slowest %lu us",
              messagesSinceConnect, messagesDroppedSinceConnect, maxWorkDurationMicros);
     uiQueue->post(LINK_MSG_DEBUG, line);
+
+    // Replies to the phone that never went out -- each one would have
+    // eventually hung unpatched ArduinoBLE (see Ble_hci.cpp).
+    unsigned long unsent = bleHciFlushedPackets() - flushedAtConnect;
+    unsigned long timedOut = bleHciTimedOutPackets() - timedOutAtConnect;
+    if (unsent > 0 || timedOut > 0) {
+      snprintf(line, sizeof(line), "BLE drop: %lu replies unsent, %lu timed out",
+               unsent, timedOut);
+      uiQueue->post(LINK_MSG_DEBUG, line);
+    }
 
     // Defensive: explicitly resume advertising so the board is always
     // reconnectable right away, without relying on the BLE stack resuming
@@ -178,6 +200,22 @@ static void handleBleInput() {
     messageQueueCount--;
     messagesSinceConnect++;
   }
+}
+
+// Posts the connected phone's signal strength (RSSI, in dBm) for the UI's
+// signal chart, every RSSI_REPORT_INTERVAL_MS. Keeps posting BLE_RSSI_NONE
+// while nothing is connected, so the chart keeps moving and shows the gap.
+static void reportSignalStrength() {
+  static uint32_t lastReportMs = 0;
+  uint32_t now = millis();
+  if (now - lastReportMs < RSSI_REPORT_INTERVAL_MS) return;
+  lastReportMs = now;
+
+  // Asks the radio for the connection's RSSI and waits for the answer (about
+  // 2 ms). BLE_RSSI_NONE straight away if there's no connection.
+  char text[8];
+  snprintf(text, sizeof(text), "%d", BLE.rssi());
+  uiQueue->post(LINK_MSG_RSSI, text);
 }
 
 static void bleThreadMain() {
@@ -198,6 +236,10 @@ static void bleThreadMain() {
     handleBleInput();
     unsigned long workMicros = micros() - workStartMicros;
     if (workMicros > maxWorkDurationMicros) maxWorkDurationMicros = workMicros;
+
+    // Not timed above: it waits on the radio, while "slowest" is meant to
+    // catch slow message handling.
+    reportSignalStrength();
   }
 }
 
