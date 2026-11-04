@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "arduino": {
+      "command": "npx",
+      "args": ["-y", "arduino-mcp-server"],
+      "env": {
+        "PATH": "${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}

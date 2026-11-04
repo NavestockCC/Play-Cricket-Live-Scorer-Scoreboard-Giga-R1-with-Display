@@ -1,27 +1,27 @@
 #include <Arduino.h>
 #include <Arduino_H7_Video.h>
+#include <Arduino_GigaDisplayTouch.h>
 #include <string.h>
 #include <stdio.h>
 #include "lvgl.h"
 #include "GigaDisplay/Giga_Display.h"
-#include "scoreboard_config/pins_and_constants.h"
-#include "scoreboard/shift_register.h"
-#include "scoreboard/display_controller.h"
+#include "shared/scoreboard_configs.h"
+#include "shared/score_fields.h"
+#include "shared/core_link.h"
 
 /* -------------------------------------------------------------
  * HARDWARE CONFIGURATION & GLOBAL LABELS
  * ------------------------------------------------------------- */
 // Primary hardware display wrapper object instance
-Arduino_H7_Video Display(800, 480, GigaDisplayShield); 
+static Arduino_H7_Video Display(800, 480, GigaDisplayShield);
 
-// Global object hooks for updating UI elements from BLE or main program files
-lv_obj_t *lbl_batA_val;
-lv_obj_t *lbl_score_val;
-lv_obj_t *lbl_batB_val;
-lv_obj_t *lbl_wickets_val;
-lv_obj_t *lbl_overs_val;
-lv_obj_t *lbl_target_val;
-lv_obj_t *lbl_sidebar_log; // Global handle targeting the rolling list view
+// GT911 touch controller. begin() registers it with LVGL as the pointer
+// input device -- without it the touchscreen (e.g. the config picker) is inert.
+static Arduino_GigaDisplayTouch TouchDetector;
+
+// Value label of each field's score card, indexed by ScoreFieldId.
+static lv_obj_t *score_cards[FIELD_COUNT];
+static lv_obj_t *lbl_sidebar_log; // the rolling log list
 
 /* -------------------------------------------------------------
  * ROLLING LOG TRACKING MEMORY ARRAYS
@@ -37,7 +37,9 @@ static char combined_text_buffer[MAX_HISTORY_ITEMS * (ITEM_BUFFER_SIZE + 6)];
 
 /* -------------------------------------------------------------
  * SCOREBOARD CONFIG PICKER: lets the operator choose which physical rig
- * (SCOREBOARD_CONFIGS entry) is active, from the touchscreen.
+ * (SCOREBOARD_CONFIGS entry) is active, from the touchscreen. The M4 owns
+ * the active rig: the picker only sends it a request, and the selection is
+ * confirmed (or snapped back) by the M4's reply -- see show_active_config().
  * ------------------------------------------------------------- */
 static lv_obj_t *config_dropdown = NULL;
 static char config_options_buffer[128];
@@ -56,32 +58,27 @@ static void build_config_options_text() {
     }
 }
 
-// Fired when the operator picks a different rig from the dropdown: switches
-// the active config, re-configures that rig's pins, and repaints the
-// physical displays with the current scores through the new hardware.
+// Fired when the operator picks a different rig from the dropdown: asks the
+// M4 to switch the physical scoreboard to it. The M4 replies with the rig
+// now active, which the picker then shows (see show_active_config()).
 static void config_dropdown_event_cb(lv_event_t * e) {
     (void)e;
     if (config_dropdown == NULL) return;
 
     uint16_t selectedIndex = lv_dropdown_get_selected(config_dropdown);
-    if (selectedIndex >= (uint16_t)SCOREBOARD_CONFIG_COUNT) return;
+    coreLinkSendInt(LINK_MSG_CONFIG, selectedIndex);
+}
 
-    activeScoreboardConfigIndex = selectedIndex;
-    const ScoreboardChainsConfig& newConfig = SCOREBOARD_CONFIGS[selectedIndex];
-
-    setupShiftRegisterChain(newConfig.top);
-    setupShiftRegisterChain(newConfig.bottom);
-    update_Scoreboard();
-
-    char message[40];
-    snprintf(message, sizeof(message), "Config: %s", newConfig.name);
-    update_display_card(lbl_sidebar_log, message);
+void show_active_config(int index) {
+    if (config_dropdown == NULL) return;
+    if (index < 0 || index >= SCOREBOARD_CONFIG_COUNT) return;
+    lv_dropdown_set_selected(config_dropdown, (uint32_t)index); // doesn't fire VALUE_CHANGED
 }
 
 /* -------------------------------------------------------------
  * HELPER FUNCTION: CREATE A STYLIZED WHITE SCORE CARD
  * ------------------------------------------------------------- */
-lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
+static lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
     // 1. Instantiate layout cell backing container box 
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_set_grid_cell(card, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
@@ -98,16 +95,15 @@ lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
     lv_obj_t *lbl_head = lv_label_create(card);
     lv_label_set_text(lbl_head, heading);
     lv_obj_set_style_text_color(lbl_head, lv_color_hex(0x555555), LV_PART_MAIN);
-    
-    const lv_font_t * base_font = lv_font_get_default();
-    lv_obj_set_style_text_font(lbl_head, base_font, LV_PART_MAIN); 
+    lv_obj_set_style_text_font(lbl_head, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_align(lbl_head, LV_ALIGN_TOP_MID, 0, 0);
 
-    // 4. Setup Dynamic Output Value Label (Large, Bold Black text centered)
+    // 4. Setup Dynamic Output Value Label (Large Black text centered).
+    // 36px keeps the widest value (e.g. overs "12.3") inside a ~95px-wide card.
     lv_obj_t *lbl_val = lv_label_create(card);
     lv_label_set_text(lbl_val, "-");
     lv_obj_set_style_text_color(lbl_val, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_val, base_font, LV_PART_MAIN); 
+    lv_obj_set_style_text_font(lbl_val, &lv_font_montserrat_36, LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(lbl_val, 2, LV_PART_MAIN);
     lv_obj_align(lbl_val, LV_ALIGN_CENTER, 0, 10);
 
@@ -117,7 +113,7 @@ lv_obj_t* create_card(lv_obj_t *parent, const char *heading, int col, int row) {
 /* -------------------------------------------------------------
  * CORE SCOREBOARD UI GENERATOR
  * ------------------------------------------------------------- */
-void create_scoreboard_grid() {
+static void create_scoreboard_grid() {
     // 1. Initialize screen layer backing properties
     lv_obj_t * scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x03989e), LV_PART_MAIN);
@@ -155,12 +151,13 @@ void create_scoreboard_grid() {
     lv_obj_t * title = lv_label_create(header);
     lv_label_set_text(title, "Cricket Scoreboard");
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(title, lv_font_get_default(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
 
     build_config_options_text();
     config_dropdown = lv_dropdown_create(header);
     lv_dropdown_set_options(config_dropdown, config_options_buffer);
-    lv_dropdown_set_selected(config_dropdown, (uint16_t)activeScoreboardConfigIndex);
+    // Shows the boot default until the M4 reports the actual active rig.
+    lv_dropdown_set_selected(config_dropdown, (uint32_t)defaultScoreboardConfigIndex());
     lv_obj_add_event_cb(config_dropdown, config_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* -------------------------------------------------------------
@@ -182,15 +179,16 @@ void create_scoreboard_grid() {
     lv_obj_set_grid_dsc_array(left_panel, left_col_dsc, left_row_dsc);
     lv_obj_set_layout(left_panel, LV_LAYOUT_GRID);
 
-    // Build upper row metric blocks (Row index 0)
-    lbl_batA_val  = create_card(left_panel, "Bat A",  0, 0);
-    lbl_score_val = create_card(left_panel, "Score",  1, 0);
-    lbl_batB_val  = create_card(left_panel, "Bat B",  2, 0);
-
-    // Build lower row metric blocks (Row index 1)
-    lbl_wickets_val = create_card(left_panel, "Wickets", 0, 1);
-    lbl_overs_val   = create_card(left_panel, "Overs",   1, 1);
-    lbl_target_val  = create_card(left_panel, "Target",  2, 1);
+    // Card positions: {field, column, row}
+    static const struct { ScoreFieldId field; int col; int row; } card_cells[FIELD_COUNT] = {
+        {FIELD_BAT_A,   0, 0}, {FIELD_SCORE, 1, 0}, {FIELD_BAT_B,  2, 0},
+        {FIELD_WICKETS, 0, 1}, {FIELD_OVERS, 1, 1}, {FIELD_TARGET, 2, 1},
+    };
+    for (int i = 0; i < FIELD_COUNT; i++) {
+        ScoreFieldId field = card_cells[i].field;
+        score_cards[field] = create_card(left_panel, SCORE_FIELDS[field].label,
+                                         card_cells[i].col, card_cells[i].row);
+    }
 
     /* -------------------------------------------------------------
      * RIGHT PANEL SUB-GRID: Sidebar Module (50% Width)
@@ -236,8 +234,8 @@ void create_scoreboard_grid() {
 /* -------------------------------------------------------------
  * DYNAMIC ENGINE: ROLLING UPDATE BULLETED LIST CONTROLLER
  * ------------------------------------------------------------- */
-void update_display_card(lv_obj_t *label, const char *new_value) {
-    if (label == NULL || new_value == NULL) return;
+void append_log_line(const char *new_value) {
+    if (lbl_sidebar_log == NULL || new_value == NULL) return;
 
     // 1. Shift memory array metrics when max list index constraints are reached
     if (history_count >= MAX_HISTORY_ITEMS) {
@@ -271,15 +269,20 @@ void update_display_card(lv_obj_t *label, const char *new_value) {
     }
 
     // 4. Force repaint payload message block onto the layout layer
-    lv_label_set_text(label, combined_text_buffer);
+    lv_label_set_text(lbl_sidebar_log, combined_text_buffer);
 }
 
 /* -------------------------------------------------------------
- * SIMPLE SETTER: SINGLE CURRENT VALUE (SCORE CARDS)
+ * SCORE MESSAGES FROM THE M4
  * ------------------------------------------------------------- */
-void set_card_value(lv_obj_t *label, const char *new_value) {
-    if (label == NULL || new_value == NULL) return;
-    lv_label_set_text(label, new_value);
+void show_score_message(const char *message) {
+    ScoreFieldId field = findScoreField(message);
+    if (field == FIELD_COUNT || score_cards[field] == NULL) return;
+
+    // Full value text, e.g. overs "12.3" (the physical board shows only "12").
+    lv_label_set_text(score_cards[field], message + SCORE_CODE_LENGTH);
+    // Log the raw message, e.g. "• BTR142".
+    append_log_line(message);
 }
 
 /* -------------------------------------------------------------
@@ -287,6 +290,7 @@ MAIN INITIALIZATION ENTRY POINT
 ------------------------------------------------------------- */
 void display_setup() {
     Display.begin();
+    TouchDetector.begin(); // must follow Display.begin() (which calls lv_init())
     create_scoreboard_grid();
 }
 
