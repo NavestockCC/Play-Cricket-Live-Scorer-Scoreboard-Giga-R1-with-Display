@@ -283,6 +283,7 @@ static void create_scoreboard_grid() {
     build_config_options_text();
     config_dropdown = lv_dropdown_create(header);
     lv_dropdown_set_options(config_dropdown, config_options_buffer);
+    lv_obj_set_width(config_dropdown, 190); // fits "Breadboard Test"; the default clips it
     // Shows the boot default until the M4 reports the actual active rig.
     lv_dropdown_set_selected(config_dropdown, (uint32_t)defaultScoreboardConfigIndex());
     lv_obj_add_event_cb(config_dropdown, config_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);

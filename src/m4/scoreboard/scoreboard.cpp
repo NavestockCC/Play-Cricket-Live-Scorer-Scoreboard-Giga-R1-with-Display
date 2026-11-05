@@ -6,11 +6,6 @@
 #include "shared/core_link.h"
 #include "shared/scoreboard_configs.h"
 
-// Fields on each row, in on-screen (left-to-right) order.
-const int FIELDS_PER_ROW = 3;
-static const ScoreFieldId TOP_ROW[FIELDS_PER_ROW]    = {FIELD_BAT_A, FIELD_SCORE, FIELD_BAT_B};
-static const ScoreFieldId BOTTOM_ROW[FIELDS_PER_ROW] = {FIELD_OVERS, FIELD_WICKETS, FIELD_TARGET};
-
 // Requests from other threads, guarded by 'stateMutex'. The output thread
 // copies them out under the lock and does the slow hardware work without it.
 static rtos::Mutex stateMutex;
@@ -66,10 +61,10 @@ static void pushValues(const int values[FIELD_COUNT]) {
   const ScoreboardChainsConfig& config = SCOREBOARD_CONFIGS[activeConfigIndex];
   byte rowBytes[FIELDS_PER_ROW * MAX_FIELD_DIGITS];
 
-  int count = renderRow(TOP_ROW, values, config.digitTable, rowBytes);
+  int count = renderRow(config.top.fields, values, config.digitTable, rowBytes);
   topChain.push(rowBytes, count);
 
-  count = renderRow(BOTTOM_ROW, values, config.digitTable, rowBytes);
+  count = renderRow(config.bottom.fields, values, config.digitTable, rowBytes);
   bottomChain.push(rowBytes, count);
 }
 
@@ -83,14 +78,14 @@ static void startActiveRig(const int values[FIELD_COUNT]) {
   bottomChain.enableOutputs();
 }
 
-static int rowDigits(const ScoreFieldId row[FIELDS_PER_ROW]) {
+static int rowDigits(const ShiftRegisterChainConfig& row) {
   int digits = 0;
-  for (int i = 0; i < FIELDS_PER_ROW; i++) digits += SCORE_FIELDS[row[i]].digits;
+  for (int i = 0; i < FIELDS_PER_ROW; i++) digits += SCORE_FIELDS[row.fields[i]].digits;
   return digits;
 }
 
 // Tells the M7 which rig is active (so its picker shows it), and warns on
-// its log if that rig's chip counts don't match the field layout -- nothing
+// its log if that rig's chip counts don't match its field layout -- nothing
 // overruns, but digits would land on the wrong chips.
 static void reportActiveConfig() {
   const ScoreboardChainsConfig& config = SCOREBOARD_CONFIGS[activeConfigIndex];
@@ -100,8 +95,8 @@ static void reportActiveConfig() {
   snprintf(message, sizeof(message), "Config: %s", config.name);
   coreLinkSend(LINK_MSG_LOG, message);
 
-  if (rowDigits(TOP_ROW) != config.top.numSegments ||
-      rowDigits(BOTTOM_ROW) != config.bottom.numSegments) {
+  if (rowDigits(config.top) != config.top.numSegments ||
+      rowDigits(config.bottom) != config.bottom.numSegments) {
     coreLinkSend(LINK_MSG_LOG, "WARN: digit layout mismatch");
   }
 }

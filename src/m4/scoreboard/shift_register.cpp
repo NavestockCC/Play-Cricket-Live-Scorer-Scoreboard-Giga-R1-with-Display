@@ -13,8 +13,9 @@ static std::unique_ptr<mbed::DigitalInOut> makeOutput(int arduinoPin, int initia
 
 void ShiftRegisterChain::attach(const ShiftRegisterChainConfig& config) {
   release();
-  // G/OE is active-low and pulled up to Rail L: created HIGH (outputs off).
-  oe   = makeOutput(config.oePin, 1);
+  // G/OE is active-low and pulled up on the board: created HIGH (outputs
+  // off). A board without an OE wire (NO_PIN) has its outputs always on.
+  if (config.oePin != NO_PIN) oe = makeOutput(config.oePin, 1);
   ser  = makeOutput(config.serPin, 0);
   srck = makeOutput(config.srckPin, 0);
   rck  = makeOutput(config.rckPin, 0);
@@ -22,9 +23,11 @@ void ShiftRegisterChain::attach(const ShiftRegisterChainConfig& config) {
 }
 
 void ShiftRegisterChain::release() {
-  if (!oe) return;
-  oe->write(1); // blank the displays first
-  oe->input();  // external pull-up keeps OE high
+  if (!ser) return;
+  if (oe) {
+    oe->write(1); // blank the displays first
+    oe->input();  // external pull-up keeps OE high
+  }
   ser->input();
   srck->input();
   rck->input();
@@ -50,7 +53,7 @@ void ShiftRegisterChain::shiftByte(byte value) {
 }
 
 void ShiftRegisterChain::push(const byte values[], int count) {
-  if (!oe) return;
+  if (!ser) return;
   rck->write(0);
   for (int i = count; i < numSegments; i++) shiftByte(ALL_SEGMENTS_OFF);
   for (int i = 0; i < count; i++) shiftByte(values[i]);
