@@ -15,16 +15,18 @@ public:
   // Takes the chain's pins, leaving its outputs DISABLED (OE held high
   // from the moment the pin becomes an output, so it never glitches low).
   // Push valid data with push() first, then enableOutputs(), so random
-  // power-up/stale latch contents are never shown. Releases any pins
-  // attached before.
+  // power-up/stale latch contents are never shown. On a board without an
+  // OE wire (oePin NO_PIN) the outputs are always on, so whatever the chips
+  // hold shows until the first push(). Releases any pins attached before.
   void attach(const ShiftRegisterChainConfig& config);
 
-  // Disables the outputs and stops driving the pins (all set to inputs; the
-  // external pull-up keeps OE high). Use when switching away from a rig, so
-  // its pins don't stay driven by the Giga.
+  // Disables the outputs (if the board has an OE wire) and stops driving
+  // the pins (all set to inputs; the external pull-up keeps OE high). Use
+  // when switching away from a rig, so its pins don't stay driven by the Giga.
   void release();
 
-  // Enables the chain's outputs (drives active-low OE LOW).
+  // Enables the chain's outputs (drives active-low OE LOW). Nothing to do on
+  // a board without an OE wire.
   void enableOutputs();
 
   // Shifts 'count' bytes from 'values' into the chain, then latches so all

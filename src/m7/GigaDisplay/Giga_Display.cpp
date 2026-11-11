@@ -7,6 +7,7 @@
 #include "lvgl.h"
 #include "GigaDisplay/Giga_Display.h"
 #include "shared/scoreboard_configs.h"
+#include "shared/scoreboard_modes.h"
 #include "shared/score_fields.h"
 #include "shared/core_link.h"
 
@@ -45,17 +46,19 @@ static char combined_text_buffer[MAX_HISTORY_ITEMS * (ITEM_BUFFER_SIZE + 6)];
 static lv_obj_t *config_dropdown = NULL;
 static char config_options_buffer[128];
 
-// Builds the '\n'-separated dropdown options string from SCOREBOARD_CONFIGS
-// names (LVGL dropdowns expect one option per line).
+// Adds 'name' to a dropdown options string. LVGL dropdowns take their
+// options as one '\n'-separated string, one option per line.
+static void append_option(char *options, size_t size, const char *name) {
+    if (options[0] != '\0') strncat(options, "\n", size - strlen(options) - 1);
+    strncat(options, name, size - strlen(options) - 1);
+}
+
+// Builds the dropdown options string from SCOREBOARD_CONFIGS names.
 static void build_config_options_text() {
     config_options_buffer[0] = '\0';
     for (int i = 0; i < SCOREBOARD_CONFIG_COUNT; i++) {
-        strncat(config_options_buffer, SCOREBOARD_CONFIGS[i].name,
-                sizeof(config_options_buffer) - strlen(config_options_buffer) - 1);
-        if (i < SCOREBOARD_CONFIG_COUNT - 1) {
-            strncat(config_options_buffer, "\n",
-                    sizeof(config_options_buffer) - strlen(config_options_buffer) - 1);
-        }
+        append_option(config_options_buffer, sizeof(config_options_buffer),
+                      SCOREBOARD_CONFIGS[i].name);
     }
 }
 
@@ -74,6 +77,40 @@ void show_active_config(int index) {
     if (config_dropdown == NULL) return;
     if (index < 0 || index >= SCOREBOARD_CONFIG_COUNT) return;
     lv_dropdown_set_selected(config_dropdown, (uint32_t)index); // doesn't fire VALUE_CHANGED
+}
+
+/* -------------------------------------------------------------
+ * SCOREBOARD MODE PICKER: the live scores, or one of the test patterns
+ * (shared/scoreboard_modes.h) on the physical board. Like the rig, the M4
+ * owns the active mode and confirms each pick -- see show_active_mode().
+ * ------------------------------------------------------------- */
+static lv_obj_t *mode_dropdown = NULL;
+static char mode_options_buffer[128];
+
+static void build_mode_options_text() {
+    mode_options_buffer[0] = '\0';
+    for (int i = 0; i < MODE_COUNT; i++) {
+        append_option(mode_options_buffer, sizeof(mode_options_buffer), SCOREBOARD_MODE_NAMES[i]);
+    }
+}
+
+// Fired when the operator picks a different mode: asks the M4 to switch.
+static void mode_dropdown_event_cb(lv_event_t * e) {
+    (void)e;
+    if (mode_dropdown == NULL) return;
+
+    uint16_t selectedIndex = lv_dropdown_get_selected(mode_dropdown);
+    coreLinkSendInt(LINK_MSG_MODE, selectedIndex);
+}
+
+void show_active_mode(int mode) {
+    if (mode_dropdown == NULL) return;
+    if (mode < 0 || mode >= MODE_COUNT) return;
+    lv_dropdown_set_selected(mode_dropdown, (uint32_t)mode); // doesn't fire VALUE_CHANGED
+
+    // Amber while a test runs: the physical board isn't showing the score.
+    uint32_t color = (mode == MODE_SCOREBOARD) ? 0xFFFFFF : 0xFFC107;
+    lv_obj_set_style_bg_color(mode_dropdown, lv_color_hex(color), LV_PART_MAIN);
 }
 
 /* -------------------------------------------------------------
@@ -265,24 +302,34 @@ static void create_scoreboard_grid() {
     lv_obj_set_layout(main_container, LV_LAYOUT_GRID);
 
     /* -------------------------------------------------------------
-     * HEADER: Title + scoreboard rig config picker (spans both columns)
+     * HEADER: Title + mode and rig config pickers (spans both columns)
      * ------------------------------------------------------------- */
     lv_obj_t * header = lv_obj_create(main_container);
     lv_obj_set_grid_cell(header, LV_GRID_ALIGN_STRETCH, 0, 2, LV_GRID_ALIGN_STRETCH, 0, 1);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(header, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(header, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(header, 10, LV_PART_MAIN);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t * title = lv_label_create(header);
     lv_label_set_text(title, "Cricket Scoreboard");
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_flex_grow(title, 1); // pushes the pickers to the right
+
+    build_mode_options_text();
+    mode_dropdown = lv_dropdown_create(header);
+    lv_dropdown_set_options(mode_dropdown, mode_options_buffer);
+    lv_obj_set_width(mode_dropdown, 210); // fits "Test: segment walk"
+    show_active_mode(MODE_SCOREBOARD);    // the boot mode, until the M4 reports
+    lv_obj_add_event_cb(mode_dropdown, mode_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     build_config_options_text();
     config_dropdown = lv_dropdown_create(header);
     lv_dropdown_set_options(config_dropdown, config_options_buffer);
+    lv_obj_set_width(config_dropdown, 190); // fits "Breadboard Test"; the default clips it
     // Shows the boot default until the M4 reports the actual active rig.
     lv_dropdown_set_selected(config_dropdown, (uint32_t)defaultScoreboardConfigIndex());
     lv_obj_add_event_cb(config_dropdown, config_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
