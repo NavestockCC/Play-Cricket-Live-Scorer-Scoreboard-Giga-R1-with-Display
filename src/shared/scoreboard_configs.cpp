@@ -39,6 +39,8 @@ const ScoreboardChainsConfig SCOREBOARD_CONFIGS[] = {
       0x7F, // 8
       0x6F  // 9 (with the bottom bar, like Breadboard Test)
     },
+    //               A     B     C     D     E     F     G     DP (none)
+    .segmentTable = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x00},
   },
   {
     // The project's own board: TPIC6B595N chips driving 157136V12801
@@ -73,6 +75,8 @@ const ScoreboardChainsConfig SCOREBOARD_CONFIGS[] = {
       0xFE, // 8
       0xF6  // 9
     },
+    //               A     B     C     D     E     F     G     DP
+    .segmentTable = {0x40, 0x80, 0x02, 0x04, 0x08, 0x20, 0x10, 0x01},
   },
 };
 

@@ -2,7 +2,7 @@
 #define SCOREBOARD_CONFIGS_H
 
 // Scoreboard rig presets, shared by both cores: the M4 uses the pins, field
-// order and digitTable to drive the shift registers, the M7 uses the names
+// order and segment tables to drive the shift registers, the M7 uses the names
 // for the rig picker on the touchscreen. Both firmwares compile this same
 // table, so a preset index means the same rig on either core.
 
@@ -11,6 +11,9 @@
 
 // Fields per row of the physical scoreboard.
 const int FIELDS_PER_ROW = 3;
+
+// Entries in a segmentTable: segments A-G, then the decimal point.
+const int SEGMENTS_PER_DIGIT = 8;
 
 // oePin value for a row with no output-enable wire: the board ties its
 // chips' G pins to ground, so their outputs are always on. The Giga then
@@ -43,6 +46,10 @@ struct ScoreboardChainsConfig {
   // Segment bytes for digits 0-9. Bit n drives shift-register output n
   // (Drain n); which segment that lights depends on the board's wiring.
   byte digitTable[10];
+
+  // The bit that lights each single segment -- A, B, C, D, E, F, G, then
+  // the decimal point (0 if the board has none) -- for the test patterns.
+  byte segmentTable[SEGMENTS_PER_DIGIT];
 };
 
 // All available scoreboard rig presets. Add another entry here when a new

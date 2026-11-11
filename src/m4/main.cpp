@@ -4,12 +4,13 @@
   The Giga runs two firmwares, one per core, talking over the core link
   (shared/core_link.h):
   - M4 (this firmware): the physical 7-segment scoreboard (shift
-    registers). Shows the scores the M7 forwards and owns the active rig.
+    registers). Shows the scores the M7 forwards, or a test pattern, and
+    owns the active rig and mode.
   - M7 (src/m7/): BLE input from the Play Cricket app + the Giga Display
-    Shield UI -- score cards, log, rig picker. It also boots this core
-    (RPC.begin()) and prints our debug lines to USB Serial, since the M4
-    has no USB serial of its own. (BLE can't run here: the Giga core's M4
-    build has no Bluetooth radio pins.)
+    Shield UI -- score cards, log, mode and rig pickers. It also boots
+    this core (RPC.begin()) and prints our debug lines to USB Serial,
+    since the M4 has no USB serial of its own. (BLE can't run here: the
+    Giga core's M4 build has no Bluetooth radio pins.)
 
   Hardware: two boards, connected one at a time to the same Giga pins, each
   with a preset in shared/scoreboard_configs.cpp (picked on the M7's rig
@@ -35,10 +36,15 @@
   Multiple physical rigs can be defined there and switched between at
   runtime from the M7's rig picker -- see scoreboardRequestConfig().
 
+  Modes (shared/scoreboard_modes.h, picked on the M7's mode picker): the
+  live scores, or a test pattern that loops on every digit -- count 0-9,
+  segment walk, digit chase, all on/off. See scoreboardRequestMode().
+
   Threads:
   - loop() thread: sleeps until the M7 sends a line, then applies it.
   - "scoreboard" thread (m4/scoreboard/scoreboard.cpp): renders the digits
-    and shifts them out whenever a field or the rig changes.
+    and shifts them out whenever a field, the rig or the mode changes, and
+    steps the running test pattern once a second.
   - RPC thread (RPC library): queues lines from the M7 for the loop.
 
   Breadboard Test per-chip wiring (same for both rows):
@@ -67,12 +73,14 @@
   for a common-anode display), a bit value of 1 turns that segment on.
 
   File layout:
-  - shared/scoreboard_configs.h/.cpp    -> per-rig pins, field order, digit tables (both cores)
+  - shared/scoreboard_configs.h/.cpp    -> per-rig pins, field order, segment tables (both cores)
+  - shared/scoreboard_modes.h/.cpp      -> scoreboard and test modes (both cores)
   - shared/score_fields.h/.cpp          -> the six fields and their BLE codes (both cores)
   - shared/core_link.h/.cpp             -> M4 <-> M7 message link (both cores)
   - shared/line_queue.h/.cpp            -> thread-safe line queue (both cores)
   - m4/scoreboard/shift_register.h/.cpp -> one shift-register chain (mbed GPIO)
-  - m4/scoreboard/scoreboard.h/.cpp     -> field values, active rig, output thread
+  - m4/scoreboard/test_patterns.h/.cpp  -> the test modes' patterns
+  - m4/scoreboard/scoreboard.h/.cpp     -> field values, active rig and mode, output thread
   - m4/main.cpp                         -> setup() and loop() (this file)
   - m7/main.cpp, m7/GigaDisplay/        -> display firmware (M7 core)
 */
@@ -87,8 +95,8 @@
 // Lines received from the M7.
 static LineQueue fromM7;
 
-// Applies every line the M7 has sent: score updates from BLE, and rig
-// switches from the touchscreen picker.
+// Applies every line the M7 has sent: score updates from BLE, and rig and
+// mode switches from the touchscreen pickers.
 static void handleCoreLinkInput() {
   char line[CORE_LINK_MAX_LINE];
   while (fromM7.pop(line, sizeof(line))) {
@@ -104,6 +112,9 @@ static void handleCoreLinkInput() {
         // unchanged) active rig, so the picker snaps back if the request
         // was rejected.
         scoreboardRequestConfig(atoi(text));
+        break;
+      case LINK_MSG_MODE:
+        scoreboardRequestMode(atoi(text)); // answered likewise
         break;
       default:
         break; // unknown message type, ignore

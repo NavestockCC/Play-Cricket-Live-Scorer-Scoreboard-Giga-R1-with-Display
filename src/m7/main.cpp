@@ -4,11 +4,11 @@
   The Giga runs two firmwares, one per core, talking over the core link
   (shared/core_link.h):
   - M7 (this firmware): BLE input from the Play Cricket app, and the Giga
-    Display Shield UI -- score cards, rolling log, BLE signal chart and rig
-    picker (LVGL + touch). Forwards every score to the M4, boots the M4 and
-    prints the M4's debug lines to USB Serial.
+    Display Shield UI -- score cards, rolling log, BLE signal chart, and
+    mode and rig pickers (LVGL + touch). Forwards every score to the M4,
+    boots the M4 and prints the M4's debug lines to USB Serial.
   - M4 (src/m4/): the physical 7-segment scoreboard (shift registers). Owns
-    the active rig; this core shows what the M4 reports.
+    the active rig and mode; this core shows what the M4 reports.
 
   BLE has to live on this core: the Giga core's M4 build has no Bluetooth
   radio pins, so BLE.begin() can't work there.
@@ -16,9 +16,9 @@
   File layout:
   - m7/bluetooth/Ble_input.h/.cpp       -> BLE "PlayCricketScorer" input thread
   - m7/bluetooth/Ble_hci.h/.cpp         -> fix for a hang in ArduinoBLE
-  - m7/GigaDisplay/Giga_Display.h/.cpp   -> LVGL UI, incl. the rig picker
+  - m7/GigaDisplay/Giga_Display.h/.cpp   -> LVGL UI, incl. the mode and rig pickers
   - m7/GigaDisplay/scoreboard_lv_conf.h  -> LVGL configuration
-  - shared/                              -> rig presets, fields, core link (both cores)
+  - shared/                              -> rig presets, modes, fields, core link (both cores)
   - m7/main.cpp                          -> setup() and loop() (this file)
 
   Threads:
@@ -59,6 +59,7 @@ static void handleUiInbox() {
       case LINK_MSG_SCORE:  show_score_message(text); break;
       case LINK_MSG_LOG:    append_log_line(text); break;
       case LINK_MSG_CONFIG: show_active_config(atoi(text)); break;
+      case LINK_MSG_MODE:   show_active_mode(atoi(text)); break;
       case LINK_MSG_RSSI:   show_ble_signal(atoi(text)); break;
       case LINK_MSG_DEBUG:
         Serial.println(text);
@@ -86,7 +87,8 @@ void setup() {
 }
 
 void loop() {
-  // 1. Scores, log lines and rig updates from the BLE thread and the M4.
+  // 1. Scores, log lines and rig and mode updates from the BLE thread and
+  // the M4.
   handleUiInbox();
 
   // 2. Run LVGL's due timers (rendering, touch input); it returns how long

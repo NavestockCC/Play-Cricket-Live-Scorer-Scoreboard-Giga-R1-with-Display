@@ -14,11 +14,15 @@
 //                      (3-letter code + value, e.g. "BTR142" or "OVB12.3");
 //                      the M4 shows it on the physical scoreboard.
 //   'C' + index        Request a switch to SCOREBOARD_CONFIGS[index].
+//   'M' + mode         Request a switch to ScoreboardMode 'mode' (scores or
+//                      a test pattern, see scoreboard_modes.h).
 //
 // M4 -> M7
 //   'C' + index        The active rig is SCOREBOARD_CONFIGS[index]. Sent at
 //                      boot and in reply to every M7 'C' request (also when
 //                      a request was rejected, so the picker snaps back).
+//   'M' + mode         The active mode, likewise: at boot and in reply to
+//                      every M7 'M' request.
 //   'L' + text         Line for the on-screen log (e.g. "Config: ...").
 //   'D' + text         Debug text; the M7 prints it to USB Serial (the M4
 //                      has no USB serial of its own).
@@ -36,6 +40,7 @@
 const char LINK_MSG_SCORE  = 'V';
 const char LINK_MSG_LOG    = 'L';
 const char LINK_MSG_CONFIG = 'C';
+const char LINK_MSG_MODE   = 'M';
 const char LINK_MSG_DEBUG  = 'D';
 const char LINK_MSG_RSSI   = 'R'; // M7 only, see above
 

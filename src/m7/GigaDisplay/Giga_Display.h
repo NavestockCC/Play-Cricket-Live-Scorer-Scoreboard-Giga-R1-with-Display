@@ -2,7 +2,7 @@
 #define GIGA_DISPLAY_H
 
 // Giga Display Shield UI (LVGL): score cards, rolling log, BLE signal chart
-// and rig picker.
+// and mode and rig pickers.
 // LVGL isn't thread-safe: call these only from the thread that runs
 // lv_timer_handler() (loop() in m7/main.cpp).
 
@@ -26,5 +26,10 @@ void show_ble_signal(int rssi);
 // Shows SCOREBOARD_CONFIGS[index] as the selected rig in the picker, as
 // reported by the M4 (which owns the active rig).
 void show_active_config(int index);
+
+// Shows ScoreboardMode 'mode' as the selected mode in the picker, as
+// reported by the M4 (which owns the active mode). The picker turns amber
+// while a test runs.
+void show_active_mode(int mode);
 
 #endif // GIGA_DISPLAY_H
